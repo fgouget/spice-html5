@@ -451,6 +451,8 @@ SpiceDisplayConn.prototype.process_channel_message = function(msg)
             document.getElementById(this.parent.screen_id).style.height = m.surface.height + "px";
             this.hook_events();
         }
+        if (this.streams[m.base.id].codec_type === SPICE_VIDEO_CODEC_TYPE_VP8)
+            process_video_stream_data(this.streams[m.base.id], m);
         return true;
     }
 
@@ -472,7 +474,38 @@ SpiceDisplayConn.prototype.process_channel_message = function(msg)
             console.log("Stream " + m.id + " already exists");
         else
             this.streams[m.id] = m;
-        if (m.codec_type != SPICE_VIDEO_CODEC_TYPE_MJPEG)
+        if (m.codec_type == SPICE_VIDEO_CODEC_TYPE_VP8)
+        {
+            var media = new MediaSource();
+            var v = document.createElement("video");
+            v.src = window.URL.createObjectURL(media);
+
+            v.setAttribute('autoplay', true);
+            v.setAttribute('width', m.stream_width);
+            v.setAttribute('height', m.stream_height);
+
+            var left = m.dest.left;
+            var top = m.dest.top;
+            if (this.surfaces[m.surface_id] !== undefined)
+            {
+                left += this.surfaces[m.surface_id].canvas.offsetLeft;
+                top += this.surfaces[m.surface_id].canvas.offsetTop;
+            }
+            document.getElementById(this.parent.screen_id).appendChild(v);
+            v.setAttribute('style', "position: absolute; top:" + top + "px; left:" + left + "px;");
+            console.log(v);
+
+            media.addEventListener('sourceopen', handle_video_source_open, false);
+            media.addEventListener('sourceended', handle_video_source_ended, false);
+            media.addEventListener('sourceclosed', handle_video_source_closed, false);
+
+            this.streams[m.id].video = v;
+            this.streams[m.id].media = media;
+
+            media.stream = this.streams[m.id];
+            media.spiceconn = this;
+        }
+        else if (m.codec_type != SPICE_VIDEO_CODEC_TYPE_MJPEG)
             console.log("Unhandled stream codec: " + m.codec_type);
         return true;
     }
@@ -531,6 +564,11 @@ SpiceDisplayConn.prototype.process_channel_message = function(msg)
     {
         var m = new SpiceMsgDisplayStreamDestroy(msg.data);
         DEBUG > 1 && console.log(this.type + ": MsgStreamDestroy id" + m.id);
+
+        document.getElementById(this.parent.screen_id).removeChild(this.streams[m.id].video);
+        this.streams[m.id].source_buffer = null;
+        this.streams[m.id].media = null;
+        this.streams[m.id].video = null;
         this.streams[m.id] = undefined;
         return true;
     }
@@ -882,3 +920,136 @@ function process_stream_data_report(sc, m, mmtime, latency)
         sc.streams[m.base.id].report.num_drops = 0;
     }
 }
+
+
+function handle_video_source_open(e)
+{
+    var stream = this.stream;
+    var p = this.spiceconn;
+
+    if (stream.source_buffer)
+        return;
+
+    var s = this.addSourceBuffer(SPICE_VP8_CODEC);
+    if (! s)
+    {
+        p.log_err('Codec ' + SPICE_VP8_CODEC + ' not available.');
+        return;
+    }
+
+    stream.source_buffer = s;
+    s.spiceconn = p;
+    s.stream = stream;
+
+    stream.queue = new Array();
+    stream.start_time = 0;
+    stream.cluster_time = 0;
+
+    var h = new webm_Header();
+    var te = new webm_VideoTrackEntry(this.stream.stream_width, this.stream.stream_height);
+    var t = new webm_Tracks(te);
+
+    var mb = new ArrayBuffer(h.buffer_size() + t.buffer_size())
+
+    var b = h.to_buffer(mb);
+    t.to_buffer(mb, b);
+
+    s.addEventListener('error', handle_video_buffer_error, false);
+    s.addEventListener('updateend', handle_append_video_buffer_done, false);
+
+    append_video_buffer(s, mb);
+}
+
+function handle_video_source_ended(e)
+{
+    var p = this.spiceconn;
+    p.log_err('Video source unexpectedly ended.');
+}
+
+function handle_video_source_closed(e)
+{
+    var p = this.spiceconn;
+    p.log_err('Video source unexpectedly closed.');
+}
+
+function append_video_buffer(sb, mb)
+{
+    try
+    {
+        sb.stream.append_okay = false;
+        sb.appendBuffer(mb);
+    }
+    catch (e)
+    {
+        var p = sb.spiceconn;
+        p.log_err("Error invoking appendBuffer: " + e.message);
+    }
+}
+
+function handle_append_video_buffer_done(e)
+{
+    var stream = this.stream;
+
+    if (stream.queue.length > 0)
+    {
+        var mb = stream.queue.shift();
+        append_video_buffer(stream.source_buffer, mb);
+    }
+    else
+    {
+        stream.append_okay = true;
+    }
+}
+
+function handle_video_buffer_error(e)
+{
+    var p = this.spiceconn;
+    p.log_err('source_buffer error ' + e.message);
+}
+
+function video_simple_block(stream, msg, keyframe)
+{
+    var simple = new webm_SimpleBlock(msg.base.multi_media_time - stream.cluster_time, msg.data, keyframe);
+    var mb = new ArrayBuffer(simple.buffer_size());
+    simple.to_buffer(mb);
+
+    if (stream.append_okay)
+        append_video_buffer(stream.source_buffer, mb);
+    else
+        stream.queue.push(mb);
+}
+
+function new_video_cluster(stream, msg)
+{
+    stream.cluster_time = msg.base.multi_media_time;
+    var c = new webm_Cluster(stream.cluster_time - stream.start_time, msg.data);
+
+    var mb = new ArrayBuffer(c.buffer_size());
+    c.to_buffer(mb);
+
+    if (stream.append_okay)
+        append_video_buffer(stream.source_buffer, mb);
+    else
+        stream.queue.push(mb);
+
+    video_simple_block(stream, msg, true);
+}
+
+function process_video_stream_data(stream, msg)
+{
+    if (! stream.source_buffer)
+        return true;
+
+    if (stream.start_time == 0)
+    {
+        stream.start_time = msg.base.multi_media_time;
+        stream.video.play();
+        new_video_cluster(stream, msg);
+    }
+
+    else if (msg.base.multi_media_time - stream.cluster_time >= MAX_CLUSTER_TIME)
+        new_video_cluster(stream, msg);
+    else
+        video_simple_block(stream, msg, false);
+}
+
